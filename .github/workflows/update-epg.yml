@@ -1,16 +1,9 @@
 name: Update EPG (worldwide, no credentials)
 
 on:
-  # Run manually from the Actions tab
   workflow_dispatch:
-  # And automatically every day at 03:00 UTC
   schedule:
     - cron: "0 3 * * *"
-  # Also run whenever you edit this file or push to main (optional but handy)
-  push:
-    branches: [ main ]
-    paths:
-      - ".github/workflows/update-epg.yml"
 
 permissions:
   contents: write
@@ -23,16 +16,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Download the big, worldwide XMLTV file and save as epg.xml
       - name: Download worldwide EPG
         run: |
           set -e
-          curl -fsSL --retry 3 --retry-delay 3 \
-            https://raw.githubusercontent.com/iptv-org/epg/master/guides/all.xml \
-            -o epg.xml
-          echo "Size (bytes): $(wc -c < epg.xml)"
+          URL="https://iptv-org.github.io/epg/guides/all.xml"
+          echo "Downloading EPG from $URL..."
+          curl -fSL --retry 3 --retry-delay 5 "$URL" -o epg.xml
+          echo "Downloaded size:"
+          wc -c epg.xml
+          echo "First 20 lines:"
+          head -n 20 epg.xml
 
-      # Commit the file so your raw GitHub URL always serves the latest guide
       - name: Commit epg.xml
         run: |
           git config user.name "github-actions[bot]"
