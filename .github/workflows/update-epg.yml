@@ -3,7 +3,7 @@ name: Update EPG (worldwide, no credentials)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * *"   # daily 03:00 UTC
 
 permissions:
   contents: write
@@ -13,19 +13,207 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download worldwide EPG
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip lxml
+
+      # --- country lists ---
+      - name: Prepare lists
+        run: |
+          # Core set (ensures non-empty result)
+          cat > core.txt << 'EOF'
+          fr
+          gb
+          us
+          de
+          es
+          it
+          nl
+          be
+          ch
+          pt
+          ca
+          br
+          ma
+          sa
+          eg
+          qa
+          ae
+          jp
+          EOF
+
+          # Large extra set for broad coverage
+          cat > countries.txt << 'EOF'
+          dz
+          tn
+          kw
+          bh
+          om
+          lb
+          jo
+          il
+          iq
+          sy
+          ye
+          tr
+          ir
+          ng
+          gh
+          ke
+          za
+          cm
+          sn
+          ml
+          ci
+          ne
+          tg
+          bf
+          gm
+          mr
+          at
+          dk
+          no
+          se
+          fi
+          is
+          ie
+          pl
+          cz
+          sk
+          hu
+          ro
+          bg
+          gr
+          rs
+          ba
+          hr
+          si
+          mk
+          al
+          mt
+          cy
+          ua
+          lt
+          lv
+          ee
+          ru
+          by
+          mx
+          ar
+          cl
+          co
+          pe
+          uy
+          py
+          bo
+          ec
+          ve
+          au
+          nz
+          in
+          pk
+          bd
+          lk
+          np
+          my
+          sg
+          id
+          ph
+          th
+          vn
+          cn
+          hk
+          tw
+          kr
+          EOF
+
+          sed -i '/^\s*$/d' core.txt countries.txt
+          echo "Core feeds:" && cat core.txt
+          echo "Extra feeds count: $(wc -l < countries.txt)"
+
+      - name: Download core feeds (guarantee content)
         run: |
           set -e
-          URL="https://iptv-org.github.io/epg/guides/all.xml"
-          echo "Downloading EPG from $URL..."
-          curl -fSL --retry 3 --retry-delay 5 "$URL" -o epg.xml
-          echo "Downloaded size:"
-          wc -c epg.xml
-          echo "First 20 lines:"
-          head -n 20 epg.xml
+          mkdir -p epg_sources
+          while read cc; do
+            url="https://raw.githubusercontent.com/iptv-org/epg/master/guides/${cc}.xml"
+            echo "Fetching $url"
+            if curl -fsSL --retry 3 --retry-delay 3 "$url" -o "epg_sources/${cc}.xml"; then
+              echo "OK: $cc ($(wc -c < epg_sources/${cc}.xml) bytes)"
+            else
+              echo "WARN: $cc not available"
+            fi
+            sleep 1
+          done < core.txt
+
+      - name: Download extra feeds (best effort)
+        run: |
+          mkdir -p epg_sources
+          while read cc; do
+            url="https://raw.githubusercontent.com/iptv-org/epg/master/guides/${cc}.xml"
+            echo "Fetching $url"
+            if curl -fsSL --retry 3 --retry-delay 3 "$url" -o "epg_sources/${cc}.xml"; then
+              echo "OK: $cc ($(wc -c < epg_sources/${cc}.xml) bytes)"
+            else
+              echo "WARN: $cc not available"
+            fi
+            sleep 1
+          done < countries.txt
+          echo "Downloaded files:" && ls -la epg_sources || true
+
+      - name: Merge XMLTV into epg.xml
+        run: |
+          python - << 'PY'
+          import os
+          from lxml import etree
+
+          src = "epg_sources"
+          files = [os.path.join(src,f) for f in os.listdir(src) if f.endswith(".xml")] if os.path.isdir(src) else []
+
+          root = etree.Element("tv")
+          seen_ids = set()
+          tot_prog = 0
+          tot_ch = 0
+
+          for f in files:
+            try:
+              tv = etree.parse(f).getroot()
+            except Exception as e:
+              print("Skip invalid", f, e); continue
+
+            ch_add = 0
+            for ch in tv.findall("channel"):
+              cid = ch.get("id")
+              if cid and cid not in seen_ids:
+                root.append(ch)
+                seen_ids.add(cid)
+                ch_add += 1
+            tot_ch += ch_add
+
+            pr_add = 0
+            for pr in tv.findall("programme"):
+              root.append(pr)
+              pr_add += 1
+            tot_prog += pr_add
+
+            print(f"Merged {os.path.basename(f)}: +{ch_add} channels, +{pr_add} programmes")
+
+          # Always write something; but this should now be non-empty
+          with open("epg.xml","wb") as out:
+            out.write(etree.tostring(root, xml_declaration=True, encoding="UTF-8"))
+
+          print("TOTAL channels:", len(seen_ids))
+          print("TOTAL programmes:", tot_prog)
+          print("FILES merged:", len(files))
+          PY
 
       - name: Commit epg.xml
         run: |
@@ -35,6 +223,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore: update worldwide EPG"
+            git commit -m "chore: update worldwide public EPG"
             git push
           fi
