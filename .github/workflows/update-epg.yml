@@ -1,12 +1,119 @@
-name: Test Workflow
+name: Update EPG
 
 on:
-  push:
   workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'   # daily 03:00 UTC
+
+permissions:
+  contents: write
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Say Hello
-        run: echo "GitHub Actions is working!"
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip lxml requests
+
+      - name: Prepare list of country feeds
+        run: |
+          cat > countries.txt << 'EOF'
+          fr
+          ma
+          sa
+          qa
+          eg
+          ae
+          ng
+          de
+          nl
+          be
+          ch
+          at
+          dk
+          ie
+          es
+          pt
+          it
+          tr
+          rs
+          gb
+          us
+          ca
+          br
+          il
+          lb
+          my
+          sg
+          EOF
+          sed -i '/^\s*$/d' countries.txt
+          echo "Countries:" && cat countries.txt
+
+      - name: Download XMLTV files
+        run: |
+          mkdir -p epg_sources
+          while read cc; do
+            url="https://raw.githubusercontent.com/iptv-org/epg/master/guides/${cc}.xml"
+            echo "Fetching $url"
+            if curl -fsSL "$url" -o "epg_sources/${cc}.xml"; then
+              echo "OK: ${cc}"
+            else
+              echo "WARN: ${cc} not available, skipping"
+            fi
+          done < countries.txt
+          ls -l epg_sources || true
+
+      - name: Merge XMLTV into one file
+        run: |
+          python - << 'PY'
+          import os, sys
+          from lxml import etree
+
+          src_dir = "epg_sources"
+          files = [os.path.join(src_dir, f) for f in os.listdir(src_dir) if f.endswith(".xml")]
+          if not files:
+            root = etree.Element("tv")
+            open("epg.xml","wb").write(etree.tostring(root, xml_declaration=True, encoding="UTF-8"))
+            sys.exit(0)
+
+          root = etree.Element("tv")
+          seen = set()
+
+          for f in files:
+            try:
+              tv = etree.parse(f).getroot()
+            except Exception as e:
+              print("Skipping invalid:", f, e); continue
+
+            for ch in tv.findall("channel"):
+              cid = ch.get("id")
+              if cid and cid not in seen:
+                root.append(ch); seen.add(cid)
+
+            for pr in tv.findall("programme"):
+              root.append(pr)
+
+          with open("epg.xml","wb") as out:
+            out.write(etree.tostring(root, xml_declaration=True, encoding="UTF-8"))
+          print("Merged. Channels:", len(seen))
+          PY
+
+      - name: Commit EPG
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add epg.xml
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else:
+            git commit -m "chore: update EPG"
+            git push
