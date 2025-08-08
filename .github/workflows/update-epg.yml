@@ -30,16 +30,14 @@ jobs:
           FILE_ID: "1ycrzgwIoDsf_Rc11V3jj1D47mF33RTID"
         run: |
           set -e
-          # Robust Google Drive downloader (handles confirmation for large files)
           URL="https://drive.google.com/uc?export=download&id=${FILE_ID}"
           echo "Downloading playlist from Google Drive..."
           curl -c /tmp/cookies -fsSL "$URL" -o /tmp/intermediate.html || true
           CONFIRM=$(sed -n 's/.*confirm=\([0-9A-Za-z_]*\).*/\1/p' /tmp/intermediate.html | head -n 1)
           if [ -n "$CONFIRM" ]; then
-            echo "Large file confirmation detected, using token..."
+            echo "Large file confirmation detected"
             curl -Lb /tmp/cookies -fsSL "https://drive.google.com/uc?export=download&confirm=${CONFIRM}&id=${FILE_ID}" -o playlist.m3u
           else
-            # small file path (direct)
             curl -fsSL "$URL" -o playlist.m3u
           fi
           echo "Playlist size (bytes): $(wc -c < playlist.m3u)"
@@ -52,51 +50,42 @@ jobs:
           from lxml import etree
           import requests
 
-          # ---------- helpers ----------
           def norm(s: str) -> str:
             if not s: return ""
-            s = unidecode(s)
-            s = s.strip().lower()
+            s = unidecode(s).strip().lower()
             s = re.sub(r"\s+", " ", s)
             return s
 
-          # ---------- 1) parse playlist ----------
-          pth = "playlist.m3u"
-          if not os.path.exists(pth) or os.path.getsize(pth) == 0:
+          # 1) Load playlist
+          if not os.path.exists("playlist.m3u") or os.path.getsize("playlist.m3u") == 0:
             print("ERROR: playlist.m3u missing or empty"); sys.exit(1)
+          txt = open("playlist.m3u","r",encoding="utf-8",errors="ignore").read()
 
-          text = open(pth, "r", encoding="utf-8", errors="ignore").read()
-
-          tvg_ids = set()
-          names = set()
-
-          for m in re.finditer(r'#EXTINF[^\n]*tvg-id="([^"]+)"[^\n]*,(.*)', text, flags=re.IGNORECASE):
-            tvg_ids.add(m.group(1).strip())
-            names.add(m.group(2).strip())
-
-          for m in re.finditer(r'#EXTINF[^\n]*tvg-name="([^"]+)"[^\n]*,(.*)', text, flags=re.IGNORECASE):
-            names.add(m.group(1).strip())
-            names.add(m.group(2).strip())
+          # Extract tvg-id and names
+          tvg_ids = set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\n]*tvg-id="([^"]+)"', txt, re.I))
+          names = set(m.group(2).strip() for m in re.finditer(r'#EXTINF[^\n]*,(.+)$', txt, re.M))
+          # also tvg-name
+          names |= set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\n]*tvg-name="([^"]+)"', txt, re.I))
 
           names_norm = {norm(n) for n in names if n}
           tvg_ids = {i for i in tvg_ids if i}
 
           print(f"Playlist: {len(tvg_ids)} tvg-ids; {len(names_norm)} names")
 
-          # ---------- 2) infer countries & add a strong core ----------
+          # 2) Infer country codes from tvg-id suffix like *.fr / *.us, but keep only 2–3 letters
           cc = set()
           for i in tvg_ids:
-            if "." in i:
-              tail = i.split(".")[-1].lower()
-              if 2 <= len(tail) <= 3:
-                cc.add(tail)
+            m = re.search(r'\.([a-z]{2,3})$', i, re.I)
+            if m: cc.add(m.group(1).lower())
 
+          # Always include a reliable core so we never end up empty
           core = {"fr","gb","us","de","es","it","nl","be","ch","pt","ca","br","ma","sa","eg","qa","ae","jp"}
           cc |= core
-          print("Country feeds to try:", sorted(cc))
+          cc = {c for c in cc if re.fullmatch(r'[a-z]{2,3}', c)}
+          print("Country feeds to fetch:", sorted(cc))
 
-          # ---------- 3) name -> iptv-org id map ----------
-          chan_url = "https://raw.githubusercontent.com/iptv-org/database/master/data/channels.json"
+          # 3) Load iptv-org channels database (NEW URL)
+          chan_url = "https://raw.githubusercontent.com/iptv-org/channels/master/data/channels.json"
           print("Downloading channels.json ...")
           r = requests.get(chan_url, timeout=90)
           r.raise_for_status()
@@ -105,40 +94,41 @@ jobs:
           for ch in db:
             cid = ch.get("id")
             if not cid: continue
-            if ch.get("name"):
-              name_to_ids.setdefault(norm(ch["name"]), set()).add(cid)
-            for nm in ch.get("names", []):
-              name_to_ids.setdefault(norm(nm), set()).add(cid)
+            nm = ch.get("name")
+            if nm: name_to_ids.setdefault(norm(nm), set()).add(cid)
+            for alias in ch.get("names", []):
+              name_to_ids.setdefault(norm(alias), set()).add(cid)
 
+          # Build keep set = tvg-ids + any ids matched by normalized names
           keep_ids = set(tvg_ids)
           for n in names_norm:
             keep_ids |= name_to_ids.get(n, set())
           print("Will keep programmes for", len(keep_ids), "channel ids")
 
-          # ---------- 4) download EPG country files ----------
+          # 4) Download EPG XMLs for relevant countries
           os.makedirs("epg_sources", exist_ok=True)
           downloaded = []
           for c in sorted(cc):
             url = f"https://raw.githubusercontent.com/iptv-org/epg/master/guides/{c}.xml"
             try:
               print("Fetch", url)
-              r = requests.get(url, timeout=180)
-              if r.status_code == 200 and r.content.strip():
+              rs = requests.get(url, timeout=180)
+              if rs.status_code == 200 and rs.content.strip():
                 p = os.path.join("epg_sources", f"{c}.xml")
-                open(p, "wb").write(r.content)
+                open(p, "wb").write(rs.content)
                 downloaded.append(p)
-                print(" OK", c, len(r.content), "bytes")
+                print(" OK", c, len(rs.content), "bytes")
               else:
-                print(" SKIP", c, r.status_code)
+                print(" SKIP", c, rs.status_code)
             except Exception as e:
               print(" ERR", c, e)
 
           if not downloaded:
             print("No EPG sources downloaded — writing minimal tv element.")
-            open("epg.xml","wb").write(b'<?xml version="1.0" encoding="UTF-8"?><tv/>')
+            open("epg.xml","wb").write(b'<?xml version=\"1.0\" encoding=\"UTF-8\"?><tv/>')
             sys.exit(0)
 
-          # ---------- 5) merge only matching channels/programmes ----------
+          # 5) Merge only matching channels/programmes
           root = etree.Element("tv")
           seen_channels = set()
           kept_prog = 0
@@ -151,13 +141,11 @@ jobs:
             for ch in tv.findall("channel"):
               cid = ch.get("id")
               if cid in keep_ids and cid not in seen_channels:
-                root.append(ch)
-                seen_channels.add(cid)
+                root.append(ch); seen_channels.add(cid)
 
             for pr in tv.findall("programme"):
               if pr.get("channel") in keep_ids:
-                root.append(pr)
-                kept_prog += 1
+                root.append(pr); kept_prog += 1
 
           out = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
           open("epg.xml","wb").write(out)
