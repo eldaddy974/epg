@@ -2,6 +2,16 @@ name: Build Custom EPG from Your M3U (Google Drive)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/update-epg.yml"
+      - "README.md"
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -14,79 +24,139 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests m3u-parser xmltodict
+          pip install requests lxml unidecode
 
       - name: Download playlist from Google Drive
+        env:
+          FILE_ID: "1ycrzgwIoDsf_Rc11V3jj1D47mF33RTID"
         run: |
           set -e
-          echo "Downloading M3U from Google Drive..."
-          curl -L "https://drive.google.com/uc?export=download&id=1ycrzgwIoDsf_Rc11V3jj1D47mF33RTID" -o playlist.m3u
-          echo "Playlist size:"
-          wc -c playlist.m3u
+          URL="https://drive.google.com/uc?export=download&id=${FILE_ID}"
+          echo "Downloading playlist from Google Drive..."
+          # first request (gets confirm token for large files)
+          curl -c /tmp/cookies -fsSL "$URL" -o /tmp/intermediate.html || true
+          CONFIRM=$(sed -n 's/.*confirm=\([0-9A-Za-z_]*\).*/\1/p' /tmp/intermediate.html | head -n 1)
+          if [ -n "$CONFIRM" ]; then
+            echo "Large file confirmation detected"
+            curl -Lb /tmp/cookies -fsSL "https://drive.google.com/uc?export=download&confirm=${CONFIRM}&id=${FILE_ID}" -o playlist.m3u
+          else
+            curl -fsSL "$URL" -o playlist.m3u
+          fi
+          echo "Playlist size (bytes): $(wc -c < playlist.m3u)"
 
       - name: Build epg.xml filtered to your channels
         run: |
-          set -x
           python - << 'PY'
-import traceback
+import sys, os, re, traceback
+from unidecode import unidecode
+from lxml import etree
+import requests
+
+def norm(s: str) -> str:
+    if not s: return ""
+    s = unidecode(s).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
 try:
-    import requests
-    import xmltodict
-    from m3u_parser import M3uParser
+    # 1) Load playlist
+    if not os.path.exists("playlist.m3u") or os.path.getsize("playlist.m3u") == 0:
+        print("ERROR: playlist.m3u missing or empty"); sys.exit(1)
+    txt = open("playlist.m3u","r",encoding="utf-8",errors="ignore").read()
 
-    # Load playlist
-    with open("playlist.m3u", "r", encoding="utf-8", errors="ignore") as f:
-        playlist_content = f.read()
+    # Extract tvg-id and names (robust)
+    tvg_ids = set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\\n]*tvg-id="([^"]+)"', txt, re.I))
+    names = set(m.group(2).strip() for m in re.finditer(r'#EXTINF[^\\n]*,(.+)$', txt, re.M))
+    names |= set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\\n]*tvg-name="([^"]+)"', txt, re.I))
 
-    parser = M3uParser()
-    parser.parse_m3u(playlist_content)
+    names_norm = {norm(n) for n in names if n}
+    tvg_ids = {i for i in tvg_ids if i}
+    print(f"Playlist: {len(tvg_ids)} tvg-ids; {len(names_norm)} names")
 
-    tvg_ids = set()
-    for ch in parser.get_list():
-        if ch.get("tvg_id"):
-            tvg_ids.add(ch["tvg_id"])
+    # 2) Infer countries from tvg-id suffix *.fr etc. + add a core so we never get empty
+    cc = set()
+    for i in tvg_ids:
+        m = re.search(r'\\.([a-z]{2,3})$', i, re.I)
+        if m: cc.add(m.group(1).lower())
+    core = {"fr","gb","us","de","es","it","nl","be","ch","pt","ca","br","ma","sa","eg","qa","ae","jp"}
+    cc |= core
+    cc = {c for c in cc if re.fullmatch(r'[a-z]{2,3}', c)}
+    print("Country feeds to fetch:", sorted(cc))
 
-    print(f"Playlist: {len(tvg_ids)} tvg-ids; {len(parser.get_list())} names")
-
-    # Download channels.json
-    channels_url = "https://iptv-org.github.io/api/channels.json"
+    # 3) Name -> iptv-org id map (CORRECT URL)
+    chan_url = "https://raw.githubusercontent.com/iptv-org/channels/master/data/channels.json"
     print("Downloading channels.json ...")
-    channels = requests.get(channels_url)
-    channels.raise_for_status()
-    channels_data = channels.json()
+    r = requests.get(chan_url, timeout=120)
+    r.raise_for_status()
+    db = r.json()
+    name_to_ids = {}
+    for ch in db:
+        cid = ch.get("id")
+        if not cid: continue
+        if ch.get("name"):
+            name_to_ids.setdefault(norm(ch["name"]), set()).add(cid)
+        for alias in ch.get("names", []) or []:
+            name_to_ids.setdefault(norm(alias), set()).add(cid)
 
-    # Download EPG
-    epg_url = "https://iptv-org.github.io/epg/guides/all.xml"
-    print("Downloading full EPG ...")
-    epg = requests.get(epg_url)
-    epg.raise_for_status()
-    epg_dict = xmltodict.parse(epg.text)
+    keep_ids = set(tvg_ids)
+    for n in names_norm:
+        keep_ids |= name_to_ids.get(n, set())
+    print("Will keep programmes for", len(keep_ids), "channel ids")
 
-    # Filter EPG
-    epg_dict["tv"]["channel"] = [
-        c for c in epg_dict["tv"].get("channel", [])
-        if c.get("@id") in tvg_ids
-    ]
-    epg_dict["tv"]["programme"] = [
-        p for p in epg_dict["tv"].get("programme", [])
-        if p.get("@channel") in tvg_ids
-    ]
+    # 4) Download country EPGs
+    os.makedirs("epg_sources", exist_ok=True)
+    downloaded = []
+    for c in sorted(cc):
+        url = f"https://raw.githubusercontent.com/iptv-org/epg/master/guides/{c}.xml"
+        try:
+            print("Fetch", url)
+            rs = requests.get(url, timeout=180)
+            if rs.status_code == 200 and rs.content.strip():
+                p = os.path.join("epg_sources", f"{c}.xml")
+                open(p, "wb").write(rs.content)
+                downloaded.append(p)
+                print(" OK", c, len(rs.content), "bytes")
+            else:
+                print(" SKIP", c, rs.status_code)
+        except Exception as e:
+            print(" ERR", c, e)
 
-    # Save filtered EPG
-    with open("epg.xml", "w", encoding="utf-8") as f:
-        f.write(xmltodict.unparse(epg_dict, pretty=True))
+    if not downloaded:
+        print("No EPG sources downloaded — writing minimal tv element.")
+        open("epg.xml","wb").write(b'<?xml version=\"1.0\" encoding=\"UTF-8\"?><tv/>')
+        sys.exit(0)
 
-    print("EPG build complete.")
+    # 5) Merge only matching channels/programmes
+    root = etree.Element("tv")
+    seen_channels = set()
+    kept_prog = 0
+    for p in downloaded:
+        try:
+            tv = etree.parse(p).getroot()
+        except Exception as e:
+            print("Bad XML", p, e); continue
+
+        for ch in tv.findall("channel"):
+            cid = ch.get("id")
+            if cid in keep_ids and cid not in seen_channels:
+                root.append(ch); seen_channels.add(cid)
+
+        for pr in tv.findall("programme"):
+            if pr.get("channel") in keep_ids:
+                root.append(pr); kept_prog += 1
+
+    out = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
+    open("epg.xml","wb").write(out)
+    print(f"Written epg.xml with {len(seen_channels)} channels and {kept_prog} programmes")
 
 except Exception as e:
     print("FATAL ERROR:", e)
     traceback.print_exc()
-    import sys
     sys.exit(1)
 PY
 
@@ -97,7 +167,7 @@ PY
           git add epg.xml
           if git diff --cached --quiet; then
             echo "No changes to commit."
-          else
-            git commit -m "Update custom EPG"
+          else:
+            git commit -m "chore: build custom EPG from Google Drive playlist"
             git push
           fi
