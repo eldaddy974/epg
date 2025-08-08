@@ -25,43 +25,37 @@ jobs:
         run: |
           python -m pip install --upgrade pip lxml
 
-      # Try single worldwide feed first (covers ~all channels)
-      - name: Try worldwide feed (all.xml)
-        id: fetch_all
+      - name: Prepare country lists
         run: |
-          set -e
-          URL="https://raw.githubusercontent.com/iptv-org/epg/master/guides/all.xml"
-          echo "Downloading: $URL"
-          curl -fsSL --retry 3 --retry-delay 3 "$URL" -o epg.xml || true
-          if [ -f epg.xml ]; then
-            SZ=$(wc -c < epg.xml || echo 0)
-            echo "Downloaded epg.xml bytes: $SZ"
-            # if > 500KB we consider it valid and skip fallback
-            if [ "$SZ" -gt 512000 ]; then
-              echo "use_all=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "use_all=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "use_all=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # If all.xml was too small/missing, build by countries (big list)
-      - name: Prepare country list (fallback)
-        if: steps.fetch_all.outputs.use_all == 'false'
-        run: |
-          cat > countries.txt << 'EOF'
+          # a small "core" that almost always exists (to avoid empty epg.xml)
+          cat > core.txt << 'EOF'
           fr
+          gb
+          us
+          de
+          es
+          it
+          nl
+          be
+          ch
+          pt
+          ca
+          br
           ma
+          sa
+          eg
+          qa
+          ae
+          jp
+          EOF
+
+          # a much larger set to approach ~10k channels
+          cat > countries.txt << 'EOF'
           dz
           tn
-          sa
-          ae
-          qa
           kw
           bh
           om
-          eg
           lb
           jo
           il
@@ -83,22 +77,13 @@ jobs:
           bf
           gm
           mr
-          es
-          pt
-          it
-          de
           at
-          ch
-          nl
-          be
-          lu
           dk
           no
           se
           fi
           is
           ie
-          gb
           pl
           cz
           sk
@@ -120,10 +105,7 @@ jobs:
           ee
           ru
           by
-          us
-          ca
           mx
-          br
           ar
           cl
           co
@@ -149,7 +131,6 @@ jobs:
           cn
           hk
           tw
-          jp
           kr
           qa
           ae
@@ -165,48 +146,77 @@ jobs:
           sy
           ye
           EOF
-          sed -i '/^\s*$/d' countries.txt
-          echo "Using $(wc -l < countries.txt) country feeds"
 
-      - name: Download country feeds (fallback)
-        if: steps.fetch_all.outputs.use_all == 'false'
+          sed -i '/^\s*$/d' core.txt countries.txt
+          echo "Core feeds:" && cat core.txt
+          echo "Extra feeds:" && wc -l countries.txt
+
+      - name: Download core feeds (guarantee content)
         run: |
           mkdir -p epg_sources
           while read cc; do
             url="https://raw.githubusercontent.com/iptv-org/epg/master/guides/${cc}.xml"
             echo "Fetching $url"
             if curl -fsSL --retry 3 --retry-delay 3 "$url" -o "epg_sources/${cc}.xml"; then
-              echo "OK: $cc"
+              echo "OK: $cc ($(wc -c < epg_sources/${cc}.xml) bytes)"
+            else
+              echo "WARN: $cc not available"
+            fi
+          done < core.txt
+
+      - name: Download extra feeds (best effort)
+        run: |
+          while read cc; do
+            url="https://raw.githubusercontent.com/iptv-org/epg/master/guides/${cc}.xml"
+            echo "Fetching $url"
+            if curl -fsSL --retry 3 --retry-delay 3 "$url" -o "epg_sources/${cc}.xml"; then
+              echo "OK: $cc ($(wc -c < epg_sources/${cc}.xml) bytes)"
             else
               echo "WARN: $cc not available"
             fi
           done < countries.txt
-          ls -la epg_sources || true
+          echo "Downloaded files:" && ls -la epg_sources || true
 
-      - name: Merge country feeds into epg.xml (fallback)
-        if: steps.fetch_all.outputs.use_all == 'false'
+      - name: Merge XMLTV into epg.xml
         run: |
           python - << 'PY'
           import os
           from lxml import etree
+
           src = "epg_sources"
           files = [os.path.join(src,f) for f in os.listdir(src) if f.endswith(".xml")] if os.path.isdir(src) else []
+
           root = etree.Element("tv")
           seen = set()
+          total_prog = 0
+          total_ch = 0
+
           for f in files:
             try:
               tv = etree.parse(f).getroot()
             except Exception as e:
               print("Skip invalid", f, e); continue
+
+            ch_count = 0
             for ch in tv.findall("channel"):
               cid = ch.get("id")
               if cid and cid not in seen:
-                root.append(ch); seen.add(cid)
+                root.append(ch); seen.add(cid); ch_count += 1
+            total_ch += ch_count
+
+            pr_count = 0
             for pr in tv.findall("programme"):
-              root.append(pr)
+              root.append(pr); pr_count += 1
+            total_prog += pr_count
+
+            print(f"Merged {os.path.basename(f)}: +{ch_count} channels, +{pr_count} programmes")
+
           with open("epg.xml","wb") as out:
             out.write(etree.tostring(root, xml_declaration=True, encoding="UTF-8"))
-          print("Merged channels:", len(seen), "from files:", len(files))
+
+          print("TOTAL channels:", len(seen))
+          print("TOTAL programmes:", total_prog)
+          print("FILES merged:", len(files))
           PY
 
       - name: Commit epg.xml
@@ -217,6 +227,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore: update worldwide EPG"
+            git commit -m "chore: update worldwide public EPG"
             git push
           fi
