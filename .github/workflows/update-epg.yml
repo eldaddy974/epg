@@ -63,10 +63,15 @@ jobs:
                   print("ERROR: playlist.m3u missing or empty"); sys.exit(1)
               txt = open("playlist.m3u","r",encoding="utf-8",errors="ignore").read()
 
-              # Extract tvg-id and names
-              tvg_ids = set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\n]*tvg-id="([^"]+)"', txt, re.I))
-              names = set(m.group(2).strip() for m in re.finditer(r'#EXTINF[^\n]*,(.+)$', txt, re.M))
-              names |= set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\n]*tvg-name="([^"]+)"', txt, re.I))
+              # Extract tvg-id and names (FIX: use group(1), not group(2))
+              tvg_ids = set(m.group(1).strip()
+                            for m in re.finditer(r'#EXTINF[^\n]*tvg-id="([^"]+)"', txt, re.I))
+
+              names = set()
+              for m in re.finditer(r'#EXTINF[^\n]*tvg-name="([^"]+)"', txt, re.I):
+                  if m.group(1): names.add(m.group(1).strip())
+              for m in re.finditer(r'#EXTINF[^\n]*,(.+)$', txt, re.M):
+                  if m.group(1): names.add(m.group(1).strip())
 
               names_norm = {norm(n) for n in names if n}
               tvg_ids = {i for i in tvg_ids if i}
