@@ -41,34 +41,55 @@ jobs:
       - name: Write builder script
         run: |
           cat > build_epg.py <<'PY'
-          import os, re, sys, gzip, io, traceback
+          import os, re, sys, io, gzip, traceback
           from lxml import etree
           import requests
           from unidecode import unidecode
 
-          MIRRORS = [
-            "https://cdn.jsdelivr.net/gh/iptv-org/epg@master/guides/{cc}.xml",
-            "https://raw.githubusercontent.com/iptv-org/epg/master/guides/{cc}.xml",
-            "https://iptv-org.github.io/epg/guides/{cc}.xml",
-          ]
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-          def fetch_guide(cc: str) -> bytes | None:
-            for tpl in MIRRORS:
-              url = tpl.format(cc=cc)
-              try:
-                r = requests.get(url, timeout=60)
-                if r.status_code == 200:
-                  data = r.content
-                  if data[:2] == b"\x1f\x8b":
-                    import gzip, io
-                    with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
-                      data = gz.read()
-                  print(f"  OK {cc} via {url}")
-                  return data
-                else:
-                  print(f"  SKIP {cc} {r.status_code} via {url}")
-              except Exception as e:
-                print(f"  ERR  {cc} via {url}: {e}")
+          # Mirrors + path templates. We'll try *.xml.gz first, then *.xml.
+          MIRRORS = [
+            "https://cdn.jsdelivr.net/gh/iptv-org/epg@master/guides/{name}",
+            "https://raw.githubusercontent.com/iptv-org/epg/master/guides/{name}",
+            "https://iptv-org.github.io/epg/guides/{name}",
+          ]
+          NAMES_FOR_CC = lambda cc: [f"{cc}.xml.gz", f"{cc}.xml"]
+          NAMES_ALL     = ["all.xml.gz", "all.xml"]
+
+          def http_get(url):
+            try:
+              r = requests.get(url, timeout=90, headers={"User-Agent": UA})
+              return r.status_code, r.content
+            except Exception as e:
+              print(f"     ERR {url}: {e}")
+              return 599, b""
+
+          def fetch_one(name):
+            for m in MIRRORS:
+              url = m.format(name=name)
+              code, body = http_get(url)
+              if code == 200:
+                # Decompress if gzipped (by content, not by extension)
+                if body[:2] == b"\x1f\x8b":
+                  body = gzip.GzipFile(fileobj=io.BytesIO(body)).read()
+                print(f"     OK  {url}")
+                return body
+              else:
+                print(f"     SKIP {code} {url}")
+            return None
+
+          def fetch_cc(cc):
+            for nm in NAMES_FOR_CC(cc):
+              data = fetch_one(nm)
+              if data: return data
+            return None
+
+          def fetch_all():
+            for nm in NAMES_ALL:
+              data = fetch_one(nm)
+              if data: return data
             return None
 
           def norm(s: str) -> str:
@@ -82,31 +103,34 @@ jobs:
               print("FATAL: playlist.m3u missing or empty"); sys.exit(1)
 
             txt = open("playlist.m3u","r",encoding="utf-8",errors="ignore").read()
-            tvg_ids = set(m.group(1).strip() for m in re.finditer(r'tvg-id="([^"]+)"', txt))
-            names = set(m.group(1).strip() for m in re.finditer(r'tvg-name="([^"]+)"', txt))
-            names |= set(m.group(1).strip() for m in re.finditer(r"#EXTINF:[^\n]*?,\s*([^\r\n]+)", txt))
-            names_norm = {norm(n) for n in names if n}
-            tvg_ids = {i for i in tvg_ids if i}
+
+            tvg_ids  = set(m.group(1).strip() for m in re.finditer(r'tvg-id="([^"]+)"', txt))
+            names    = set(m.group(1).strip() for m in re.finditer(r'tvg-name="([^"]+)"', txt))
+            names   |= set(m.group(1).strip() for m in re.finditer(r"#EXTINF:[^\n]*?,\s*([^\r\n]+)", txt))
+            names_n  = {norm(n) for n in names if n}
+            tvg_ids  = {i for i in tvg_ids if i}
+
             print(f"Playlist: {len(tvg_ids)} unique tvg-ids; {len(names)} names")
 
-            cc_list = [
-              "fr","gb","us","ca","de","es","it","pt","nl","be","se","no","dk","fi","pl","cz","sk","hu","ro","gr",
-              "tr","ie","ch","at","au","nz","ar","br","mx","co","jp","kr","in","id","sg","th","ph","my","vn","za","eg"
-            ]
+            # Probe for countries mentioned; if none, try common ones.
+            cc_list = ["fr","gb","us","ca","de","es","it","pt","nl","be","se","no","dk","fi","pl","ch","at","ie"]
             txt_low = txt.lower()
-            maybe = {cc for cc in cc_list if re.search(rf"\\b{cc}\\b", txt_low)}
+            maybe   = {cc for cc in cc_list if re.search(rf"\\b{cc}\\b", txt_low)}
             if not maybe: maybe = {"fr","gb","us"}
             print("Will try feeds:", sorted(maybe))
 
             root = etree.Element("tv")
             channels_seen = set()
             progs = 0
+            any_ok = False
 
+            # 1) Try per-country
             for cc in sorted(maybe):
-              print("Fetch", cc)
-              data = fetch_guide(cc)
+              print(f"Fetch {cc}")
+              data = fetch_cc(cc)
               if not data:
                 continue
+              any_ok = True
               try:
                 doc = etree.fromstring(data)
               except Exception as e:
@@ -117,7 +141,7 @@ jobs:
                 cid = ch.get("id") or ""
                 cname = (ch.findtext("display-name") or "").strip()
                 if tvg_ids and cid not in tvg_ids:
-                  if cname and norm(cname) not in names_norm:
+                  if cname and norm(cname) not in names_n:
                     continue
                 if cid not in channels_seen:
                   channels_seen.add(cid)
@@ -125,15 +149,45 @@ jobs:
 
               for pr in doc.findall("programme"):
                 cid = pr.get("channel") or ""
-                if cid in channels_seen or not tvg_ids:
+                if (not tvg_ids) or (cid in channels_seen):
                   root.append(pr); progs += 1
 
               print(f"  Tally: channels {len(channels_seen)}, programmes {progs}")
 
+            # 2) If we still have nothing, fall back to ALL
+            if not channels_seen:
+              print("Per-country failed. Falling back to ALL…")
+              data = fetch_all()
+              if data:
+                any_ok = True
+                try:
+                  doc = etree.fromstring(data)
+                except Exception as e:
+                  print("  parse error ALL", e)
+                  doc = None
+                if doc is not None:
+                  for ch in doc.findall("channel"):
+                    cid = ch.get("id") or ""
+                    cname = (ch.findtext("display-name") or "").strip()
+                    if tvg_ids and cid not in tvg_ids:
+                      if cname and norm(cname) not in names_n:
+                        continue
+                    if cid not in channels_seen:
+                      channels_seen.add(cid)
+                      root.append(ch)
+                  for pr in doc.findall("programme"):
+                    cid = pr.get("channel") or ""
+                    if (not tvg_ids) or (cid in channels_seen):
+                      root.append(pr); progs += 1
+
+            if not any_ok:
+              print("ERROR: No EPG sources could be downloaded.")
+            else:
+              print(f"Done. channels written={len(channels_seen)}, programmes written={progs}")
+
             open("epg.xml","wb").write(
               etree.tostring(root, encoding="utf-8", xml_declaration=True)
             )
-            print(f"Done. channels written={len(channels_seen)}, programmes written={progs}")
 
           except Exception:
             traceback.print_exc(); sys.exit(1)
