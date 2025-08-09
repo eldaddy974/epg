@@ -29,7 +29,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install lxml requests unidecode gdown
 
-      # 👉 If your Drive link ever changes, only update FILE_ID below.
       - name: Download playlist from Google Drive (robust)
         env:
           FILE_ID: 1ycrzgwIoDsf_Rc11V3jj1D47mF33RTID
@@ -37,7 +36,6 @@ jobs:
           set -euo pipefail
           gdown --id "$FILE_ID" --output playlist.m3u
           echo "Playlist bytes: $(wc -c < playlist.m3u || true)"
-          echo "First 5 lines:"
           head -n 5 playlist.m3u || true
 
       - name: Write builder script
@@ -48,6 +46,31 @@ jobs:
           import requests
           from unidecode import unidecode
 
+          MIRRORS = [
+            "https://cdn.jsdelivr.net/gh/iptv-org/epg@master/guides/{cc}.xml",
+            "https://raw.githubusercontent.com/iptv-org/epg/master/guides/{cc}.xml",
+            "https://iptv-org.github.io/epg/guides/{cc}.xml",
+          ]
+
+          def fetch_guide(cc: str) -> bytes | None:
+            for tpl in MIRRORS:
+              url = tpl.format(cc=cc)
+              try:
+                r = requests.get(url, timeout=60)
+                if r.status_code == 200:
+                  data = r.content
+                  if data[:2] == b"\x1f\x8b":
+                    import gzip, io
+                    with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
+                      data = gz.read()
+                  print(f"  OK {cc} via {url}")
+                  return data
+                else:
+                  print(f"  SKIP {cc} {r.status_code} via {url}")
+              except Exception as e:
+                print(f"  ERR  {cc} via {url}: {e}")
+            return None
+
           def norm(s: str) -> str:
             if not s: return ""
             s = unidecode(s).strip().lower()
@@ -56,42 +79,23 @@ jobs:
 
           try:
             if not os.path.exists("playlist.m3u") or os.path.getsize("playlist.m3u") == 0:
-              print("FATAL: playlist.m3u missing or empty")
-              sys.exit(1)
+              print("FATAL: playlist.m3u missing or empty"); sys.exit(1)
 
-            txt = open("playlist.m3u", "r", encoding="utf-8", errors="ignore").read()
-
-            # Grab tvg-id and tvg-name (many lists use one or the other)
+            txt = open("playlist.m3u","r",encoding="utf-8",errors="ignore").read()
             tvg_ids = set(m.group(1).strip() for m in re.finditer(r'tvg-id="([^"]+)"', txt))
             names = set(m.group(1).strip() for m in re.finditer(r'tvg-name="([^"]+)"', txt))
-            # Some lists put the name right after -1,
-            # e.g. #EXTINF:-1 ... ,Channel Name
             names |= set(m.group(1).strip() for m in re.finditer(r"#EXTINF:[^\n]*?,\s*([^\r\n]+)", txt))
-
-            tvg_ids = {i for i in tvg_ids if i}
             names_norm = {norm(n) for n in names if n}
-
+            tvg_ids = {i for i in tvg_ids if i}
             print(f"Playlist: {len(tvg_ids)} unique tvg-ids; {len(names)} names")
 
-            # Where to fetch EPG from. We'll try a small, reliable set of country feeds.
-            # (Fetching 100+ that don’t exist = many 404s and slow runs.)
             cc_list = [
-              "fr","gb","us","ca","de","es","it","pt","nl","be",
-              "se","no","dk","fi","pl","cz","sk","hu","ro","gr",
-              "tr","ie","ch","at","au","nz","ar","br","mx","co",
-              "jp","kr","in","id","sg","th","ph","my","vn","za","eg"
+              "fr","gb","us","ca","de","es","it","pt","nl","be","se","no","dk","fi","pl","cz","sk","hu","ro","gr",
+              "tr","ie","ch","at","au","nz","ar","br","mx","co","jp","kr","in","id","sg","th","ph","my","vn","za","eg"
             ]
-
-            # Keep only countries that appear in group/title or name to reduce noise
             txt_low = txt.lower()
-            maybe = set()
-            for cc in cc_list:
-              pat = re.compile(rf"\b{cc}\b")
-              if pat.search(txt_low):
-                maybe.add(cc)
-            if not maybe:
-              maybe = {"fr","gb","us"}  # default trio
-
+            maybe = {cc for cc in cc_list if re.search(rf"\\b{cc}\\b", txt_low)}
+            if not maybe: maybe = {"fr","gb","us"}
             print("Will try feeds:", sorted(maybe))
 
             root = etree.Element("tv")
@@ -99,57 +103,40 @@ jobs:
             progs = 0
 
             for cc in sorted(maybe):
-              url = f"https://iptv-org.github.io/epg/guides/{cc}.xml"
-              print("Fetch", cc, url, "...")
+              print("Fetch", cc)
+              data = fetch_guide(cc)
+              if not data:
+                continue
               try:
-                r = requests.get(url, timeout=40)
-                if r.status_code != 200:
-                  print("SKIP", cc, r.status_code)
-                  continue
-                data = r.content
-                # decompress if gz (some mirrors serve gz)
-                if data[:2] == b"\x1f\x8b":
-                  with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
-                    data = gz.read()
-
                 doc = etree.fromstring(data)
-
-                for ch in doc.findall("channel"):
-                  cid = ch.get("id") or ""
-                  name_el = ch.find("display-name")
-                  cname = name_el.text if name_el is not None else ""
-                  if tvg_ids and cid not in tvg_ids:
-                    # allow name matching as fallback
-                    if cname and norm(cname) not in names_norm:
-                      continue
-                  # copy channel
-                  if cid not in channels_seen:
-                    channels_seen.add(cid)
-                    root.append(ch)
-
-                for pr in doc.findall("programme"):
-                  cid = pr.get("channel") or ""
-                  ok = False
-                  if cid in channels_seen:
-                    ok = True
-                  elif not tvg_ids:
-                    ok = True
-                  if ok:
-                    root.append(pr)
-                    progs += 1
-
-                print(f"  OK: channels so far {len(channels_seen)}, programmes {progs}")
-
               except Exception as e:
-                print("  ERROR", cc, e)
+                print("  parse error", cc, e)
+                continue
 
-            out = etree.tostring(root, encoding="utf-8", xml_declaration=True)
-            open("epg.xml", "wb").write(out)
+              for ch in doc.findall("channel"):
+                cid = ch.get("id") or ""
+                cname = (ch.findtext("display-name") or "").strip()
+                if tvg_ids and cid not in tvg_ids:
+                  if cname and norm(cname) not in names_norm:
+                    continue
+                if cid not in channels_seen:
+                  channels_seen.add(cid)
+                  root.append(ch)
+
+              for pr in doc.findall("programme"):
+                cid = pr.get("channel") or ""
+                if cid in channels_seen or not tvg_ids:
+                  root.append(pr); progs += 1
+
+              print(f"  Tally: channels {len(channels_seen)}, programmes {progs}")
+
+            open("epg.xml","wb").write(
+              etree.tostring(root, encoding="utf-8", xml_declaration=True)
+            )
             print(f"Done. channels written={len(channels_seen)}, programmes written={progs}")
 
           except Exception:
-            traceback.print_exc()
-            sys.exit(1)
+            traceback.print_exc(); sys.exit(1)
           PY
 
       - name: Build epg.xml filtered to your channels
