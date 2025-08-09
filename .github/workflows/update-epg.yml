@@ -2,13 +2,25 @@ name: Build Custom EPG from Your M3U (Google Drive)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"    # daily at 03:00 UTC
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/update-epg.yml"
+      - "README.md"
 
 permissions:
   contents: write
 
+env:
+  # ✏️ Put your Google Drive FILE ID here (the long string in the share link)
+  FILE_ID: 1ycrzgwIoDsf_Rc11V3jj1D47mF33RTID
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -16,143 +28,47 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.11"
 
       - name: Install deps
         run: |
-          pip install requests lxml gdown
+          python -m pip install --upgrade pip
+          pip install requests lxml unidecode gdown
 
       - name: Download playlist from Google Drive (robust)
+        shell: bash
         run: |
           set -euo pipefail
-          gdown "https://drive.google.com/uc?id=1ycrzgwIoDsf_Rc11V3jj1D47mF33RTID" --output playlist.m3u
-          echo "Playlist bytes: $(wc -c < playlist.m3u)"
-          echo "First 5 lines:"; head -n 5 playlist.m3u || true
+          gdown --id "$FILE_ID" --output playlist.m3u
+          echo "Playlist bytes: $(wc -c < playlist.m3u || true)"
+          echo "First 5 lines:"
+          head -n 5 playlist.m3u || true
 
       - name: Build epg.xml filtered to your channels
+        shell: bash
         run: |
           set -euo pipefail
-          python <<'PY'
-          import io, gzip, json, re, sys, requests
+          python - << 'PY'
+          import os, re, io, gzip, sys, time
+          import requests
           from lxml import etree
+          from unidecode import unidecode
 
-          # --- helpers ---
-          def fetch(url, timeout=60):
-            r = requests.get(url, timeout=timeout)
-            r.raise_for_status()
-            return r.content
+          # ---------- helpers ----------
+          def norm(s: str) -> str:
+            if not s: return ""
+            s = unidecode(s).strip().lower()
+            s = re.sub(r"\s+", " ", s)
+            return s
 
-          def fetch_text(url, timeout=60):
-            return fetch(url, timeout).decode('utf-8', 'ignore')
-
-          def try_fetch_epg(country):
-            """Return bytes of XML for a country, handling .xml or .xml.gz."""
-            base = f"https://iptv-org.github.io/epg/guides/{country.lower()}"
-            candidates = [base + ".xml", base + ".xml.gz"]
-            last_err = None
-            for u in candidates:
-              try:
-                data = fetch(u, timeout=120)
-                if u.endswith(".gz"):
-                  try:
-                    data = gzip.decompress(data)
-                  except OSError:
-                    # some pages serve already-decompressed
-                    pass
-                # quick sanity check
-                if b"<tv" in data:
-                  print(f"Fetch OK: {u}")
-                  return data
-              except Exception as e:
-                print(f"SKIP {u}: {e}")
-                last_err = e
-            raise last_err or RuntimeError("No epg for " + country)
-
-          # --- 1) parse playlist & collect tvg-ids ---
-          with open("playlist.m3u", encoding="utf-8", errors="ignore") as f:
-            m3u = f.read()
-          tvg_ids = sorted(set(re.findall(r'tvg-id="([^"]+)"', m3u)))
-          print(f"Found {len(tvg_ids)} unique tvg-ids")
-
-          if not tvg_ids:
-            # fallback: also try channel names (less reliable)
-            names = re.findall(r'#EXTINF:[^\n]*,(.+)$', m3u, flags=re.M)
-            names = [n.strip() for n in names if n.strip()]
-            print(f"No tvg-ids in playlist, found {len(names)} names")
-
-          # --- 2) map tvg-ids -> countries using iptv-org database ---
-          channels_url = "https://raw.githubusercontent.com/iptv-org/database/master/data/channels.json"
-          try:
-            channels = json.loads(fetch_text(channels_url))
-          except Exception as e:
-            print("WARNING: failed to download channels.json, will try broad countries list.", e)
-            channels = []
-
-          id_to_country = {}
-          if channels:
-            for ch in channels:
-              cid = ch.get("id")
-              ctry = ch.get("country")
-              if cid and ctry:
-                id_to_country[cid] = ctry.lower()
-
-          countries = sorted({ id_to_country.get(cid) for cid in tvg_ids if id_to_country.get(cid) })
-          print("Countries inferred from tvg-ids:", countries)
-
-          # Fallback if mapping is sparse
-          if not countries:
-            countries = ['fr','gb','de','it','es','us','ca','nl','be','pt','pl','se','no','dk','ch','at','ie','au','nz']
-            print("Using fallback country list:", countries)
-
-          # --- 3) fetch & merge EPGs for those countries ---
-          parser = etree.XMLParser(recover=True, huge_tree=True)
-          merged_tv = etree.Element("tv")
-
-          seen_channels = set()
-          kept_programmes = 0
-          wanted = set(tvg_ids)
-
-          for cc in countries:
+          def try_get(url, timeout=30):
             try:
-              xml_bytes = try_fetch_epg(cc)
-            except Exception as e:
-              print(f"Failed {cc}: {e}")
-              continue
+              r = requests.get(url, timeout=timeout)
+              if r.status_code == 200:
+                return r.content
+              return None
+            except Exception:
+              return None
 
-            try:
-              root = etree.fromstring(xml_bytes, parser)
-            except Exception as e:
-              print(f"Parse error for {cc}: {e}")
-              continue
-
-            # keep only channels/programmes that match our tvg-ids
-            for el in root:
-              if el.tag == "channel":
-                cid = el.get("id")
-                if cid in wanted and cid not in seen_channels:
-                  merged_tv.append(el)
-                  seen_channels.add(cid)
-              elif el.tag == "programme":
-                if el.get("channel") in wanted:
-                  merged_tv.append(el)
-                  kept_programmes += 1
-
-          print(f"Merged {len(seen_channels)} channels; kept {kept_programmes} programmes")
-
-          # Always write a valid tv element (even if empty)
-          out = etree.tostring(merged_tv, pretty_print=True, xml_declaration=True, encoding="utf-8")
-          with open("epg.xml", "wb") as f:
-            f.write(out)
-          PY
-
-      - name: Commit epg.xml
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add epg.xml
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "chore: update EPG"
-            git push
-          fi
+          # ---------- load playlist ----------
+          if not os.path.exists("playlist.m
