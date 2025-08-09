@@ -5,7 +5,7 @@ on:
   schedule:
     - cron: "0 3 * * *"   # daily at 03:00 UTC
   push:
-    branches: [ main ]    # run on any push to main
+    branches: [ main ]
 
 permissions:
   contents: write
@@ -39,8 +39,7 @@ jobs:
           set -euxo pipefail
           gdown --id "$FILE_ID" --output playlist.m3u
           echo "Playlist bytes: $(wc -c < playlist.m3u || true)"
-          echo "First 5 lines:"
-          head -n 5 playlist.m3u || true
+          echo "First 5 lines:"; head -n 5 playlist.m3u || true
 
       - name: Build epg.xml filtered to your channels
         run: |
@@ -63,10 +62,9 @@ jobs:
                   print("ERROR: playlist.m3u missing or empty"); sys.exit(1)
               txt = open("playlist.m3u","r",encoding="utf-8",errors="ignore").read()
 
-              # Extract tvg-id and names (FIX: use group(1), not group(2))
+              # Extract tvg-id and names
               tvg_ids = set(m.group(1).strip()
                             for m in re.finditer(r'#EXTINF[^\n]*tvg-id="([^"]+)"', txt, re.I))
-
               names = set()
               for m in re.finditer(r'#EXTINF[^\n]*tvg-name="([^"]+)"', txt, re.I):
                   if m.group(1): names.add(m.group(1).strip())
@@ -87,24 +85,40 @@ jobs:
               cc = {c for c in cc if re.fullmatch(r'[a-z]{2,3}', c)}
               print("Country feeds to fetch:", sorted(cc))
 
-              # 3) Name -> iptv-org id map
-              chan_url = "https://raw.githubusercontent.com/iptv-org/channels/master/data/channels.json"
-              print("Downloading channels.json ...")
-              r = requests.get(chan_url, timeout=120)
-              r.raise_for_status()
-              db = r.json()
-              name_to_ids = {}
-              for ch in db:
-                  cid = ch.get("id")
-                  if not cid: continue
-                  nm = ch.get("name")
-                  if nm: name_to_ids.setdefault(norm(nm), set()).add(cid)
-                  for alias in ch.get("names", []) or []:
-                      name_to_ids.setdefault(norm(alias), set()).add(cid)
+              # 3) Name -> iptv-org id map (new path + fallback)
+              urls = [
+                  "https://raw.githubusercontent.com/iptv-org/database/master/data/channels.json",
+                  "https://raw.githubusercontent.com/iptv-org/channels/master/data/channels.json",
+              ]
+              db = None
+              last_err = None
+              for u in urls:
+                  try:
+                      print("Downloading channels.json from:", u)
+                      r = requests.get(u, timeout=120)
+                      r.raise_for_status()
+                      db = r.json()
+                      print("Loaded", len(db), "channel records")
+                      break
+                  except Exception as e:
+                      print("Failed:", e)
+                      last_err = e
+              if db is None:
+                  print("WARNING: Could not load channels.json; continuing with tvg-id matching only.")
 
               keep_ids = set(tvg_ids)
-              for n in names_norm:
-                  keep_ids |= name_to_ids.get(n, set())
+              if db:
+                  name_to_ids = {}
+                  for ch in db:
+                      cid = ch.get("id")
+                      if not cid: continue
+                      nm = ch.get("name")
+                      if nm: name_to_ids.setdefault(norm(nm), set()).add(cid)
+                      for alias in ch.get("names", []) or []:
+                          if alias: name_to_ids.setdefault(norm(alias), set()).add(cid)
+                  for n in names_norm:
+                      keep_ids |= name_to_ids.get(n, set())
+
               print("Will keep programmes for", len(keep_ids), "channel ids")
 
               # 4) Download country EPGs
