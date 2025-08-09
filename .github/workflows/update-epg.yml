@@ -3,15 +3,16 @@ name: Build Custom EPG from Your M3U (Google Drive)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"
-  push:
+    - cron: "0 3 * * *"   # daily 03:00 UTC
+  push:                   # run on ANY push to main (no path filters)
     branches: [ main ]
-    paths:
-      - ".github/workflows/update-epg.yml"
-      - "README.md"
 
 permissions:
   contents: write
+
+concurrency:
+  group: epg-build
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -38,7 +39,6 @@ jobs:
           set -e
           URL="https://drive.google.com/uc?export=download&id=${FILE_ID}"
           echo "Downloading playlist from Google Drive..."
-          # first request (gets confirm token for large files)
           curl -c /tmp/cookies -fsSL "$URL" -o /tmp/intermediate.html || true
           CONFIRM=$(sed -n 's/.*confirm=\([0-9A-Za-z_]*\).*/\1/p' /tmp/intermediate.html | head -n 1)
           if [ -n "$CONFIRM" ]; then
@@ -69,26 +69,26 @@ try:
         print("ERROR: playlist.m3u missing or empty"); sys.exit(1)
     txt = open("playlist.m3u","r",encoding="utf-8",errors="ignore").read()
 
-    # Extract tvg-id and names (robust)
-    tvg_ids = set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\\n]*tvg-id="([^"]+)"', txt, re.I))
-    names = set(m.group(2).strip() for m in re.finditer(r'#EXTINF[^\\n]*,(.+)$', txt, re.M))
-    names |= set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\\n]*tvg-name="([^"]+)"', txt, re.I))
+    # Extract tvg-id and names
+    tvg_ids = set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\n]*tvg-id="([^"]+)"', txt, re.I))
+    names = set(m.group(2).strip() for m in re.finditer(r'#EXTINF[^\n]*,(.+)$', txt, re.M))
+    names |= set(m.group(1).strip() for m in re.finditer(r'#EXTINF[^\n]*tvg-name="([^"]+)"', txt, re.I))
 
     names_norm = {norm(n) for n in names if n}
     tvg_ids = {i for i in tvg_ids if i}
     print(f"Playlist: {len(tvg_ids)} tvg-ids; {len(names_norm)} names")
 
-    # 2) Infer countries from tvg-id suffix *.fr etc. + add a core so we never get empty
+    # 2) Countries from tvg-id suffix + core list
     cc = set()
     for i in tvg_ids:
-        m = re.search(r'\\.([a-z]{2,3})$', i, re.I)
+        m = re.search(r'\.([a-z]{2,3})$', i, re.I)
         if m: cc.add(m.group(1).lower())
     core = {"fr","gb","us","de","es","it","nl","be","ch","pt","ca","br","ma","sa","eg","qa","ae","jp"}
     cc |= core
     cc = {c for c in cc if re.fullmatch(r'[a-z]{2,3}', c)}
     print("Country feeds to fetch:", sorted(cc))
 
-    # 3) Name -> iptv-org id map (CORRECT URL)
+    # 3) Name -> iptv-org id (correct URL)
     chan_url = "https://raw.githubusercontent.com/iptv-org/channels/master/data/channels.json"
     print("Downloading channels.json ...")
     r = requests.get(chan_url, timeout=120)
